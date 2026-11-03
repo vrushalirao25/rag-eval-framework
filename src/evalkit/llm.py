@@ -33,10 +33,22 @@ def is_transient(exc: Exception) -> bool:
 
 class LLMClient(ABC):
     name: str
+    resolved_model: str | None = None  # exact model/version reported by the provider, when available
 
     @abstractmethod
     def complete(self, system: str, prompt: str, max_tokens: int = 800) -> str:
         ...
+
+    @property
+    def usage(self) -> dict:
+        if not hasattr(self, "_usage"):
+            self._usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0}
+        return self._usage
+
+    def _record_usage(self, input_tokens: int | None, output_tokens: int | None) -> None:
+        self.usage["calls"] += 1
+        self.usage["input_tokens"] += input_tokens or 0
+        self.usage["output_tokens"] += output_tokens or 0
 
     def complete_with_retry(self, system: str, prompt: str, max_tokens: int = 800, retries: int = 3) -> str:
         for attempt in range(retries + 1):
@@ -75,6 +87,9 @@ class BedrockClient(LLMClient):
             messages=[{"role": "user", "content": [{"text": prompt}]}],
             inferenceConfig={"temperature": 0.0, "maxTokens": max_tokens},
         )
+        usage = resp.get("usage", {})
+        self._record_usage(usage.get("inputTokens"), usage.get("outputTokens"))
+        self.resolved_model = self.model_id  # Bedrock model IDs are already version-pinned
         return "".join(block.get("text", "") for block in resp["output"]["message"]["content"])
 
 
@@ -93,6 +108,9 @@ class OpenAIClient(LLMClient):
             max_tokens=max_tokens,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
         )
+        if resp.usage:
+            self._record_usage(resp.usage.prompt_tokens, resp.usage.completion_tokens)
+        self.resolved_model = resp.model  # e.g. a dated snapshot behind an alias
         return resp.choices[0].message.content or ""
 
 

@@ -15,6 +15,7 @@ from .corpus import load_corpus
 from .diagnostics import DIMENSIONS
 from .judges import HeuristicJudge, JudgeResult, LLMJudge
 from .llm import get_client
+from .manifest import build_manifest
 from .metrics import citation_accuracy, context_precision, context_recall, refusal_outcome, schema_valid
 from .retriever import BM25Retriever
 
@@ -142,12 +143,23 @@ def aggregate(rows: list[dict], thresholds: dict) -> dict:
         reliability[key] = {"rate": rate, "errors": errors, "max": ceiling, "n": total,
                             "status": "pass" if ceiling is None or rate <= ceiling else "fail"}
 
+    # Per-category breakdown: an aggregate can pass while one question type fails badly.
+    by_category = {}
+    for cat in sorted({r.get("category") or "uncategorised" for r in rows}):
+        subset = [r for r in rows if (r.get("category") or "uncategorised") == cat]
+        entry = {"n": len(subset)}
+        for metric in ("refusal_accuracy", "context_recall", "faithfulness", "citation_accuracy"):
+            values = [r["metrics"][metric] for r in subset if metric in r["metrics"]]
+            entry[metric] = round(mean(values), 3) if values else None
+        by_category[cat] = entry
+
     latencies = sorted(r["latency_ms"] for r in rows if r.get("latency_ms") is not None)
     p95 = latencies[min(len(latencies) - 1, int(round(0.95 * (len(latencies) - 1))))] if latencies else None
     return {
         "dimensions": dims,
         "refusal_breakdown": refusal,
         "reliability": reliability,
+        "by_category": by_category,
         "latency_ms": {"mean": round(mean(latencies), 1) if latencies else None, "p95": p95},
         "n_items": len(rows),
         "passed": all(d["status"] != "fail" for d in dims.values())
@@ -166,7 +178,22 @@ def _failing_examples(rows: list[dict], dim: str, limit: int = 3) -> list[dict]:
     return sorted(bad, key=lambda r: r["metrics"][dim])[:limit]
 
 
-def render_markdown(summary: dict, rows: list[dict], run_info: dict) -> str:
+def _usage_line(manifest: dict) -> str:
+    parts = []
+    for role in ("generator", "judge"):
+        u = manifest["usage"].get(role)
+        parts.append(f"{role}: " + (f"{u['calls']} calls, {u['input_tokens']:,} in / {u['output_tokens']:,} out tokens"
+                                    if u else "mock (no tokens)"))
+    cost = manifest["cost_usd"]
+    if cost["total"] is not None:
+        per_item = cost.get("per_answered_item")
+        parts.append(f"cost: ${cost['total']:.4f}" + (f" (${per_item:.5f} per answered item)" if per_item else ""))
+    else:
+        parts.append("cost: not reported (set `pricing` in config)")
+    return " · ".join(parts)
+
+
+def render_markdown(summary: dict, rows: list[dict], run_info: dict, manifest: dict | None = None) -> str:
     icon = {"pass": "✅", "fail": "❌", "n/a": "➖"}
     lines = [
         "# Evaluation Report",
@@ -175,6 +202,16 @@ def render_markdown(summary: dict, rows: list[dict], run_info: dict) -> str:
         f"- **Generator:** `{run_info['generator']}` · **Judge:** `{run_info['judge']}`",
         f"- **Golden set:** {summary['n_items']} items · **Gate:** {'PASSED ✅' if summary['passed'] else 'FAILED ❌'}",
     ]
+    if manifest:
+        git = manifest["git"]
+        commit = f"`{git['commit'][:8]}`" + (" (uncommitted changes)" if git["dirty"] else "") if git["commit"] else "not a git checkout"
+        lines += [
+            f"- **Dataset:** `{manifest['dataset']['sha256'][:12]}` · **Corpus:** `{manifest['corpus']['sha256'][:12]}` "
+            f"({manifest['corpus']['n_documents']} docs, {manifest['corpus']['n_chunks']} chunks) · "
+            f"**Assistant prompt:** `{manifest['prompts']['assistant'][:12]}` · **Code:** {commit}",
+            f"- **Usage:** {_usage_line(manifest)}",
+            "- Full configuration, prompt versions and model versions: `manifest.json`",
+        ]
     if run_info["mock"]:
         lines += ["", "> ⚠️ Mock mode: extractive generator + heuristic judge. Use to validate the pipeline, "
                   "not to report model quality."]
@@ -192,6 +229,13 @@ def render_markdown(summary: dict, rows: list[dict], run_info: dict) -> str:
     for key, v in summary["reliability"].items():
         lines.append(f"| {rel_labels[key]} | pipeline | {_fmt(v['rate'])} | ≤ {_fmt(v['max'])} | {v['n']} | {icon[v['status']]} |")
     lines += ["", f"Latency mean/p95: **{summary['latency_ms']['mean']} / {summary['latency_ms']['p95']} ms**"]
+
+    lines += ["", "## Results by Question Category", "",
+              "| Category | n | Refusal accuracy | Context recall | Faithfulness | Citation accuracy |",
+              "|---|---|---|---|---|---|"]
+    for cat, c in summary["by_category"].items():
+        lines.append(f"| {cat} | {c['n']} | {_fmt(c['refusal_accuracy'])} | {_fmt(c['context_recall'])} | "
+                     f"{_fmt(c['faithfulness'])} | {_fmt(c['citation_accuracy'])} |")
 
     failing = [(k, d) for k, d in summary["dimensions"].items() if d["status"] == "fail"]
     lines += ["", "## Diagnosis", ""]
@@ -237,6 +281,7 @@ def render_markdown(summary: dict, rows: list[dict], run_info: dict) -> str:
 
 # ---------------------------------------------------------------- entry point
 def run(config_path: str, provider: str | None = None, limit: int | None = None, fail: bool = True) -> int:
+    started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     cfg = load_config(config_path)
     root = Path(config_path).resolve().parent.parent
     paths = {k: (root / v) for k, v in cfg["paths"].items()}
@@ -294,11 +339,23 @@ def run(config_path: str, provider: str | None = None, limit: int | None = None,
     run_info = {"run_id": run_id, "generator": gen_llm.name if gen_llm else "mock-extractive",
                 "judge": judge.name, "mock": gen_llm is None or judge_llm is None}
 
+    manifest = build_manifest(
+        run_id=run_id, started_at=started_at, finished_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        root=root, paths=paths, cfg=cfg, golden=golden, n_chunks=len(chunks),
+        clients={"generator": gen_llm, "judge": judge_llm},
+    )
+    answered = sum(1 for r in rows if (r.get("output") or {}).get("refused") is False)
+    if manifest["cost_usd"]["total"] is not None and answered:
+        manifest["cost_usd"]["per_answered_item"] = round(manifest["cost_usd"]["total"] / answered, 6)
+    summary["manifest"] = {"dataset_sha256": manifest["dataset"]["sha256"], "corpus_sha256": manifest["corpus"]["sha256"],
+                           "prompts": manifest["prompts"], "git_commit": manifest["git"]["commit"]}
+
     out_dir = paths["reports"] / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "results.jsonl").write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
     (out_dir / "summary.json").write_text(json.dumps({"run": run_info, **summary}, indent=2, ensure_ascii=False), encoding="utf-8")
-    report = render_markdown(summary, rows, run_info)
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    report = render_markdown(summary, rows, run_info, manifest)
     (out_dir / "report.md").write_text(report, encoding="utf-8")
 
     print("\n" + report)  # the report is program output, not a log line

@@ -28,5 +28,18 @@ def test_labels_are_consistent():
             assert not g["expected_sources"], f"{g['id']} is unanswerable but lists sources"
 
 
-def test_set_covers_unanswerable_cases():
-    assert sum(not g["answerable"] for g in GOLDEN) >= 5
+ALLOWED_CATEGORIES = {"factual", "paraphrase", "multi_hop", "false_premise",
+                      "unanswerable_near_miss", "unanswerable_out_of_domain"}
+
+
+def test_categories_are_known_and_match_answerability():
+    for g in GOLDEN:
+        assert g["category"] in ALLOWED_CATEGORIES, g["id"]
+        assert g["category"].startswith("unanswerable") == (not g["answerable"]), g["id"]
+
+
+def test_set_is_large_enough_to_gate_refusal_rates():
+    # A refusal-rate gate on a handful of items is statistically meaningless.
+    unanswerable = [g for g in GOLDEN if not g["answerable"]]
+    assert len(unanswerable) >= 25
+    assert sum(g["category"] == "unanswerable_near_miss" for g in unanswerable) >= 10

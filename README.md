@@ -139,14 +139,51 @@ The pipeline is designed so that nothing that went wrong can be reported as a pa
 - Judge error rate and item error rate gated, so scores are never computed on a silently shrunken dataset
 - Exit codes: `0` passed, `1` gate failed, `2` preflight failed; enforced in GitHub Actions
 
+### Golden Dataset Design
+
+The golden set has 105 questions across eight synthetic policy documents, designed to test specific behaviours rather than just coverage:
+
+| Category | n | What it tests |
+|---|---|---|
+| factual | 46 | Direct lookup of a single policy fact |
+| paraphrase | 19 | The same facts asked in everyday language |
+| multi_hop | 5 | Answers that need two sections, sometimes across documents |
+| false_premise | 5 | Questions built on a wrong assumption the assistant must correct |
+| unanswerable_near_miss | 17 | On-topic questions the documents do not answer |
+| unanswerable_out_of_domain | 13 | Questions unrelated to the policies |
+
+The golden set is tested too: unknown chunk IDs, inconsistent labels, unknown categories, or fewer than 25 unanswerable questions fail CI.
+
+### Traceability
+
+Every run writes a `manifest.json` so results are reproducible and comparable:
+
+- SHA-256 hashes of the golden set, the corpus, the assistant prompt and every judge prompt
+- Generator and judge model IDs, including the exact version the provider reports
+- Retrieval settings, thresholds and provider configuration
+- Git commit, and whether there were uncommitted changes
+- Token usage per role, and cost when prices are configured (never reported as zero when unknown)
+
+Two runs are comparable only when their dataset, corpus and prompt hashes match.
+
 ## Key Finding
 
-Even in mock mode, the evaluation design surfaced a real issue:
+The evaluation design surfaced the same failure twice, and the second time showed how much a small test set can understate it.
 
+**With 25 questions (5 unanswerable):**
 - Overall refusal accuracy: **0.92**, passing the 0.90 threshold
-- Missed refusal rate: **0.40**, with 2 of 5 unanswerable questions answered anyway
+- Missed refusal rate: **0.40**, or 2 of 5 unanswerable questions answered anyway
 
-Unanswerable questions were the minority class, so the aggregate metric hid the failure. This is why false and missed refusal rates are gated separately. The diagnosis traced both misses to topically similar sections scoring high on keyword retrieval, which points to the need for a semantic evidence-sufficiency check.
+**With 105 questions (30 unanswerable):**
+- Missed refusal rate: **0.77**, or 23 of 30 unanswerable questions answered anyway
+- Near-miss questions: **0 of 17** correctly refused
+
+Two lessons came out of this:
+
+1. **Aggregates hide minority-class failures.** This is why false and missed refusal rates are gated separately from overall refusal accuracy.
+2. **A small golden set can make a serious failure look moderate.** Five unanswerable questions were enough to detect the problem, but not to size it. The per-category breakdown then located it: on-topic questions the documents don't answer.
+
+The diagnosis traced the misses to topically similar sections scoring high on keyword retrieval, which points to the need for a semantic evidence-sufficiency check. These results are from mock mode, so they describe the retrieval-threshold approach, not a specific LLM.
 
 ## Tradeoffs Considered
 
@@ -182,7 +219,12 @@ python -m evalkit --provider bedrock --limit 3   # quick smoke test first
 python -m evalkit --provider bedrock
 ```
 
-Each run produces `reports/<run_id>/` with a readable scorecard (`report.md`), aggregate results (`summary.json`) and per-question details including judge reasoning (`results.jsonl`).
+Each run produces `reports/<run_id>/` containing:
+
+- `report.md`: scorecard, results by question category, and diagnosis
+- `summary.json`: aggregate results and gate decision
+- `results.jsonl`: per-question details, including judge reasoning
+- `manifest.json`: dataset, corpus and prompt hashes, models, configuration, git commit, token usage and cost
 
 ## Scope Clarification
 
@@ -198,19 +240,17 @@ This project is intentionally designed as an evaluation design demonstration, no
 
 Potential extensions of this framework include:
 
-- Judge calibration against human labels (Cohen's κ, position and verbosity bias tests)
-- Semantic evidence-sufficiency check to reduce missed refusals
-- Retrieval comparison using Amazon Bedrock Knowledge Bases
+- Judge calibration against human labels (Cohen's κ, position and verbosity bias tests, repeat-run consistency)
+- Semantic evidence-sufficiency check: answer, qualify or abstain
+- Retrieval comparison: keyword, dense, hybrid and re-ranking with Amazon Bedrock Knowledge Bases
 - Agent evaluation: tool selection, argument accuracy, trajectory scoring
-- Score tracking across runs to detect regressions over time
+- Run-over-run comparison using manifest hashes to detect regressions
 
 ## Related Work
 
-This repository is part of a broader focus on AI Platform Engineering and LLMOps, including:
+This repository is part of a broader focus on AI Platform Engineering and LLMOps:
 
 - [Secure RAG AI Platform on AWS](https://github.com/vrushalirao25/secure-rag-ai-platform): architecture and governance for enterprise RAG
-- Evaluation and quality standards for GenAI systems
-- Deployment and monitoring standards for ML systems
 
 ## About the Author
 
