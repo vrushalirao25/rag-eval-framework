@@ -1,0 +1,65 @@
+name: eval
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: "Provider for the live eval"
+        default: bedrock
+        type: choice
+        options: [bedrock, openai]
+
+permissions:
+  contents: read
+  id-token: write   # for AWS OIDC in the live job
+
+jobs:
+  # Runs on every PR: unit tests + golden-set integrity + pipeline smoke test (no API keys needed).
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+      - name: Pipeline smoke test (mock mode, report-only)
+        run: python -m evalkit --provider mock --no-fail
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eval-report-mock
+          path: reports/
+
+  # Manual trigger: real models, real quality gate. Fails the run if any threshold is missed.
+  live-gate:
+    if: github.event_name == 'workflow_dispatch'
+    needs: offline
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      GENERATOR_MODEL: ${{ vars.GENERATOR_MODEL }}
+      JUDGE_MODEL: ${{ vars.JUDGE_MODEL }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[bedrock,openai]"
+      - name: Configure AWS credentials (OIDC, no long-lived keys)
+        if: inputs.provider == 'bedrock'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Run eval gate
+        run: python -m evalkit --provider ${{ inputs.provider }}
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report-live
+          path: reports/

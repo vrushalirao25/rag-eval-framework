@@ -1,0 +1,33 @@
+paths:
+  corpus: data/corpus
+  golden_set: data/golden/golden_set.jsonl
+  reports: reports
+
+retrieval:
+  top_k: 3
+
+assistant:
+  provider: mock                  # mock | bedrock | openai
+  model: ${GENERATOR_MODEL}
+  min_retrieval_score: 3.0        # evidence-sufficiency threshold (mock generator only)
+
+judge:
+  provider: mock                  # use a different model family from the generator
+  model: ${JUDGE_MODEL}
+
+# Release gate: the run fails if any dimension scores below its threshold.
+thresholds:
+  schema_validity: 1.00
+  context_precision: 0.80
+  context_recall: 0.85
+  faithfulness: 0.90
+  citation_accuracy: 0.85
+  answer_relevance: 0.85
+  scope_adherence: 0.95
+  refusal_accuracy: 0.90
+  # Error-rate ceilings, gated separately so the minority class can't hide in the average.
+  max_false_refusal_rate: 0.10
+  max_missed_refusal_rate: 0.20
+  # Pipeline reliability: scores computed on a fraction of the golden set are not trustworthy.
+  max_judge_error_rate: 0.05
+  max_item_error_rate: 0.00
